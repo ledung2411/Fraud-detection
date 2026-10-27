@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fraud-detection"
+version = "0.1.0"
+description = "End-to-end card fraud detection on IEEE-CIS: time-based split, velocity features, LightGBM vs Logistic Regression, recall at a fixed review budget, SHAP, FastAPI scoring and drift monitoring."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "pyarrow>=14",
+    "scikit-learn>=1.4",
+    "lightgbm>=4.3",
+    "scipy>=1.11",
+    "pyyaml>=6",
+    "joblib>=1.3",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "pydantic>=2.5",
+    "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+explain = ["shap>=0.45"]
+dev = ["pytest>=8", "httpx>=0.27", "ruff>=0.5", "shap>=0.45"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501"]
