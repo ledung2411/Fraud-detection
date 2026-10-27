@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import math
 import threading
-from collections import deque
-from collections.abc import Sequence
+import time
+from collections import Counter, deque
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -15,8 +16,37 @@ import pandas as pd
 from ..artifacts import Bundle, load_bundle
 from ..data import ID_COL, add_time_fields
 from ..explain import reason_codes
+from ..velocity import DEFAULT_MAX_ENTITIES, DEFAULT_TTL_S
 
 MIN_ROWS_FOR_DRIFT = 200
+DEFAULT_MAX_FUTURE_SKEW_S = 300.0
+
+
+class EventClock:
+    """The latest event time the service is willing to record.
+
+    TransactionDT comes from the caller, so it cannot decide on its own how far the
+    velocity state moves: one event dated a month ahead would push every real event out
+    of its windows. This clock starts at the time the state was built up to and advances
+    with real elapsed time only, never with event timestamps, so it cannot be ratcheted
+    forward by a sequence of slightly-future events.
+    """
+
+    def __init__(
+        self,
+        start_t: float,
+        max_future_skew_s: float | None,
+        wall_clock: Callable[[], float] = time.monotonic,
+    ):
+        self.start_t = start_t
+        self.max_future_skew_s = max_future_skew_s
+        self._wall = wall_clock
+        self._wall_start = wall_clock()
+
+    def latest_allowed(self) -> float:
+        if self.max_future_skew_s is None:
+            return math.inf
+        return self.start_t + (self._wall() - self._wall_start) + self.max_future_skew_s
 
 
 class ScoringService:
@@ -26,9 +56,26 @@ class ScoringService:
     online store (state as of the end of the data the model was trained/validated on,
     then updated with every scored transaction), the rest from the frozen
     ``FeatureBuilder``. Recently scored rows are kept for drift monitoring.
+
+    A transaction is always scored, but it is only *recorded* in the velocity state if
+    its timestamp is plausible: not ahead of the :class:`EventClock` and not older than
+    the last event already recorded for its card/client. Refused writes are counted
+    (``events_not_recorded`` in :meth:`info`) so an integration sending bad timestamps
+    shows up in monitoring instead of silently corrupting the state.
+
+    ``max_future_skew_s=None`` disables the clock check; use it only for offline replays
+    that stream recorded history faster than real time.
     """
 
-    def __init__(self, bundle: Bundle, monitor_window: int = 5000):
+    def __init__(
+        self,
+        bundle: Bundle,
+        monitor_window: int = 5000,
+        max_future_skew_s: float | None = DEFAULT_MAX_FUTURE_SKEW_S,
+        max_entities: int | None = DEFAULT_MAX_ENTITIES,
+        entity_ttl_s: int | None = DEFAULT_TTL_S,
+        wall_clock: Callable[[], float] = time.monotonic,
+    ):
         if bundle.booster.feature_name() != bundle.builder.feature_names:
             raise ValueError("model and feature builder disagree on the feature list")
         self.bundle = bundle
@@ -38,6 +85,21 @@ class ScoringService:
         self._lock = threading.Lock()
         self._recent: deque[np.ndarray] = deque(maxlen=monitor_window)
         self.n_scored = 0
+        self.not_recorded: Counter[str] = Counter()
+        store = bundle.store
+        if not hasattr(store, "evicted"):
+            raise ValueError("velocity state was saved by an older version; retrain the bundle")
+        store.apply_limits(max_entities, entity_ttl_s)
+        start_t = max(store.last_seen_t or 0, self.meta.get("state_as_of_transaction_dt", 0))
+        self.clock = EventClock(start_t, max_future_skew_s, wall_clock)
+
+    def _refusal(self, rec: dict[str, Any]) -> str | None:
+        """Why ``rec`` must not be written to the velocity state, if it must not."""
+        if rec["TransactionDT"] > self.clock.latest_allowed():
+            return "future_timestamp"
+        if self.bundle.store.late_entities(rec):
+            return "out_of_order"
+        return None
 
     @classmethod
     def from_dir(cls, path: str | Path, **kwargs: Any) -> ScoringService:
@@ -61,9 +123,17 @@ class ScoringService:
         """
         b = self.bundle
         records = [add_time_fields(t) for t in transactions]
+        recorded = []
         with self._lock:
             for r in records:
-                r.update(b.store.compute_and_update(r) if update_state else b.store.compute(r))
+                refusal = self._refusal(r) if update_state else None
+                feats = b.store.compute(r)
+                if update_state and refusal is None:
+                    b.store.update(r)
+                elif refusal:
+                    self.not_recorded[refusal] += 1
+                recorded.append(update_state and refusal is None)
+                r.update(feats)
             X = b.builder.transform_records(records)
             scores = b.booster.predict(X)
             self._recent.extend(np.c_[X.astype(float), scores])
@@ -94,6 +164,7 @@ class ScoringService:
                     "decision": "review" if flagged[i] else "approve",
                     "threshold": self.threshold,
                     "reasons": reasons[i],
+                    "state_updated": recorded[i],
                     "model_version": self.meta["model_version"],
                 }
             )
@@ -133,5 +204,8 @@ class ScoringService:
             "split_days": m["split_days"],
             "test_metrics": m["test_metrics"],
             "n_scored_since_start": self.n_scored,
+            "events_not_recorded": dict(self.not_recorded),
             "entities_in_state": {e: len(s) for e, s in self.bundle.store.state.items()},
+            "entities_evicted": dict(self.bundle.store.evicted),
+            "max_future_skew_s": self.clock.max_future_skew_s,
         }

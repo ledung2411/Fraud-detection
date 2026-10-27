@@ -14,6 +14,8 @@ ARG ARTIFACTS=artifacts/synthetic
 COPY ${ARTIFACTS} /app/model
 ENV FRAUD_ARTIFACTS=/app/model
 
+# API keys are not baked in: pass FRAUD_API_KEYS / FRAUD_ANALYST_API_KEYS at run time.
+# The service refuses to start without them.
 RUN useradd --create-home app
 USER app
 EXPOSE 8000

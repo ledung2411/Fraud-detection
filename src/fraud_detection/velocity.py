@@ -27,7 +27,7 @@ the current transaction never sees itself and no label is ever used):
 from __future__ import annotations
 
 import math
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Mapping
 from typing import Any
 
@@ -138,6 +138,10 @@ def compute_velocity(
     return pd.DataFrame(out, index=df.index).astype(np.float32)
 
 
+class OutOfOrderEventError(ValueError):
+    """An event older than the last recorded event of one of its entities."""
+
+
 class _EntityState:
     __slots__ = ("events", "n", "s", "s2", "last_t")
 
@@ -149,19 +153,40 @@ class _EntityState:
         self.last_t = 0
 
 
+# Bounds on the state, so traffic cannot grow it without limit: at most this many
+# entities per entity type (least recently seen evicted first) and none idle for longer
+# than the TTL. Both are far above what IEEE-CIS needs (~250k clients, 182 days), so
+# they never change a feature on the dataset.
+DEFAULT_MAX_ENTITIES = 1_000_000
+DEFAULT_TTL_S = 400 * 86400
+
+
 class OnlineVelocityStore:
     """Per-entity state that produces the same features one transaction at a time.
 
     In production this state would live in Redis or a feature store, keyed the same
-    way; an in-process dict keeps the project self-contained. Transactions must arrive
-    in stream order. Entities are never evicted here; a real store would use a TTL.
+    way; an in-process dict keeps the project self-contained. Events must be recorded
+    in stream order: :meth:`update` refuses an event older than the last event of any of
+    its entities, so a stray or forged timestamp cannot reorder or erase history.
     """
 
-    def __init__(self, entities: Mapping[str, list[str]], windows: Mapping[str, int]):
+    def __init__(
+        self,
+        entities: Mapping[str, list[str]],
+        windows: Mapping[str, int],
+        max_entities: int | None = DEFAULT_MAX_ENTITIES,
+        ttl_s: int | None = DEFAULT_TTL_S,
+    ):
         self.entities = {k: list(v) for k, v in entities.items()}
         self.windows = dict(windows)
         self.max_w = max(self.windows.values())
-        self.state: dict[str, dict[tuple, _EntityState]] = {e: {} for e in self.entities}
+        self.max_entities = max_entities
+        self.ttl_s = ttl_s
+        # Insertion order = least recently updated first, which makes LRU/TTL eviction O(1).
+        self.state: dict[str, OrderedDict[tuple, _EntityState]] = {
+            e: OrderedDict() for e in self.entities
+        }
+        self.evicted = dict.fromkeys(self.entities, 0)
         self.last_seen_t: int | None = None
 
     @property
@@ -183,6 +208,8 @@ class OnlineVelocityStore:
                 cnt, s = 0, 0.0
                 if st:
                     for tj, aj in reversed(st.events):
+                        if tj > t:  # recorded after a late event: not in its past
+                            continue
                         if tj <= t - w:
                             break
                         cnt += 1
@@ -192,7 +219,7 @@ class OnlineVelocityStore:
                 out[f"{e}_amt_ratio_{w_name}"] = a / (s / cnt) if cnt > 0 and s > 0 else math.nan
             out[f"{e}_n_prior"] = float(n)
             if n > 0:
-                out[f"{e}_secs_since_prev"] = float(t - st.last_t)
+                out[f"{e}_secs_since_prev"] = float(max(t - st.last_t, 0))
                 mean = st.s / n
                 out[f"{e}_amt_mean_hist"] = mean
                 if n > 1:
@@ -200,8 +227,26 @@ class OnlineVelocityStore:
                     out[f"{e}_amt_z_hist"] = (a - mean) / std
         return out
 
+    def late_entities(self, txn: Mapping[str, Any]) -> list[str]:
+        """Entity types whose last recorded event is newer than ``txn``."""
+        t = int(txn[TIME_COL])
+        late = []
+        for e, cols in self.entities.items():
+            key = entity_key(txn, cols)
+            st = self.state[e].get(key) if key is not None else None
+            if st is not None and st.last_t > t:
+                late.append(e)
+        return late
+
     def update(self, txn: Mapping[str, Any]) -> None:
-        """Append ``txn`` to the state of each of its entities."""
+        """Append ``txn`` to the state of each of its entities.
+
+        Raises :class:`OutOfOrderEventError` (and changes nothing) if ``txn`` is older
+        than the last event of one of its entities.
+        """
+        late = self.late_entities(txn)
+        if late:
+            raise OutOfOrderEventError(f"event is older than the last event of: {', '.join(late)}")
         t = int(txn[TIME_COL])
         a = float(txn[AMOUNT_COL])
         self.last_seen_t = t if self.last_seen_t is None else max(self.last_seen_t, t)
@@ -209,9 +254,12 @@ class OnlineVelocityStore:
             key = entity_key(txn, cols)
             if key is None:
                 continue
-            st = self.state[e].get(key)
+            states = self.state[e]
+            st = states.get(key)
             if st is None:
-                st = self.state[e][key] = _EntityState()
+                st = states[key] = _EntityState()
+            else:
+                states.move_to_end(key)
             st.events.append((t, a))
             while st.events[0][0] <= t - self.max_w:
                 st.events.popleft()
@@ -219,6 +267,24 @@ class OnlineVelocityStore:
             st.s += a
             st.s2 += a * a
             st.last_t = t
+            self._evict(e, t)
+
+    def apply_limits(self, max_entities: int | None, ttl_s: int | None) -> None:
+        """Change the bounds and enforce them on the current state."""
+        self.max_entities, self.ttl_s = max_entities, ttl_s
+        for e in self.state:
+            self._evict(e, self.last_seen_t or 0)
+
+    def _evict(self, e: str, now: int) -> None:
+        states = self.state[e]
+        while states:
+            oldest = next(iter(states.values()))
+            too_many = self.max_entities is not None and len(states) > self.max_entities
+            expired = self.ttl_s is not None and oldest.last_t <= now - self.ttl_s
+            if not (too_many or expired):
+                break
+            states.popitem(last=False)
+            self.evicted[e] += 1
 
     def compute_and_update(self, txn: Mapping[str, Any]) -> dict[str, float]:
         feats = self.compute(txn)
@@ -227,10 +293,15 @@ class OnlineVelocityStore:
 
     @classmethod
     def from_frame(
-        cls, df: pd.DataFrame, entities: Mapping[str, list[str]], windows: Mapping[str, int]
+        cls,
+        df: pd.DataFrame,
+        entities: Mapping[str, list[str]],
+        windows: Mapping[str, int],
+        max_entities: int | None = DEFAULT_MAX_ENTITIES,
+        ttl_s: int | None = DEFAULT_TTL_S,
     ) -> OnlineVelocityStore:
         """State as it would be after streaming every row of ``df`` (vectorised)."""
-        store = cls(entities, windows)
+        store = cls(entities, windows, max_entities, ttl_s)
         if df.empty:
             return store
         t_end = int(df[TIME_COL].max())
@@ -242,15 +313,18 @@ class OnlineVelocityStore:
                 continue
             amt = sub[AMOUNT_COL].astype(float)
             agg = (
-                sub.assign(_a=amt, _a2=amt * amt)
+                sub.assign(_a=amt, _a2=amt * amt, _row=np.arange(len(sub)))
                 .groupby(cols, sort=False)
                 .agg(
                     n=(TIME_COL, "size"),
                     s=("_a", "sum"),
                     s2=("_a2", "sum"),
                     last_t=(TIME_COL, "max"),
+                    last_row=("_row", "max"),
                 )
                 .reset_index()
+                # Same order a stream would leave behind: least recently updated first.
+                .sort_values("last_row", kind="mergesort")
             )
             recent = sub[sub[TIME_COL] > t_end - store.max_w]
             recent_events: dict[tuple, list[tuple[int, float]]] = {}
@@ -265,4 +339,5 @@ class OnlineVelocityStore:
                 st.last_t = int(row.last_t)
                 st.events = deque(recent_events.get(k, ()))
                 states[k] = st
+            store._evict(e, t_end)
         return store

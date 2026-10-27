@@ -56,12 +56,18 @@ class Reason(BaseModel):
 
 
 class ScoreResponse(BaseModel):
+    """Analysts get every field; the payment switch (scorer key) gets the decision only."""
+
     TransactionID: int
-    fraud_score: float
     decision: str = Field(description="'review' if the score is above the budget threshold")
-    threshold: float
-    reasons: list[Reason]
+    state_updated: bool = Field(
+        description="whether the transaction was recorded in the velocity state (false for "
+        "what-if calls and for timestamps ahead of the service clock or out of order)"
+    )
     model_version: str
+    fraud_score: float | None = None
+    threshold: float | None = None
+    reasons: list[Reason] | None = None
 
 
 class BatchResponse(BaseModel):

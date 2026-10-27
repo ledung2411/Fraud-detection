@@ -64,35 +64,45 @@ flowchart LR
 ```bash
 make install        # pip install -e ".[dev]"
 make train          # sinh dữ liệu synthetic + chạy toàn bộ pipeline (~2 phút)
-make serve          # API ở http://localhost:8000, tài liệu ở /docs
+make serve          # API ở http://localhost:8000, tài liệu ở /docs (key dev, xem Makefile)
 make replay         # bắn tháng test qua API: kiểm tra skew, độ trễ, drift
-make test           # 25 test, ~20 giây
+make test           # 34 test, ~20 giây
 
 make train-ieee     # dữ liệu Kaggle thật, xem data/README.md
 ```
 
-Gọi API:
+Gọi API (mọi endpoint trừ `/health` cần header `X-API-Key`):
 
 ```bash
-curl -s localhost:8000/score -H 'content-type: application/json' -d '{
-  "TransactionID": 1, "TransactionDT": 15811047, "TransactionAmt": 49.0,
+curl -s localhost:8000/score -H 'content-type: application/json' \
+  -H 'X-API-Key: dev-scorer-key-change-me' -d '{
+  "TransactionID": 1, "TransactionDT": 13219939, "TransactionAmt": 49.0,
   "ProductCD": "W", "card1": 2803, "addr1": 299, "D1": 0, "P_emaildomain": "gmail.com"
 }'
 ```
 
+Key `scorer` (hệ thống thanh toán) chỉ nhận quyết định:
+
+```json
+{"TransactionID": 1, "decision": "approve", "state_updated": true, "model_version": "20261027024204"}
+```
+
+Key `analyst` nhận thêm điểm, ngưỡng và reason codes:
+
 ```json
 {
-  "TransactionID": 1,
-  "fraud_score": 0.0055,
+  "TransactionID": 2,
   "decision": "approve",
+  "state_updated": true,
+  "model_version": "20261027024204",
+  "fraud_score": 0.0725,
   "threshold": 0.888,
-  "reasons": [],
-  "model_version": "20261026102051"
+  "reasons": []
 }
 ```
 
 Một giao dịch thật của tháng test bị đưa vào hàng đợi review (365,43 USD lúc 3 giờ sáng, 11
-phút sau giao dịch trước của cùng khách), kèm reason codes từ SHAP:
+phút sau giao dịch trước của cùng khách), kèm reason codes từ SHAP (góc nhìn analyst):
 
 ```json
 {
@@ -111,19 +121,33 @@ phút sau giao dịch trước của cùng khách), kèm reason codes từ SHAP:
 
 Chỉ `TransactionID`, `TransactionDT`, `TransactionAmt` là bắt buộc; mọi cột IEEE-CIS khác
 (`C1..C14`, `D1..D15`, `M1..M9`, `V1..V339`, `id_01..id_38`, `DeviceInfo`...) gửi kèm thì
-được dùng, thiếu thì coi là missing. Endpoint:
+được dùng, thiếu thì coi là missing.
 
-| Endpoint | Việc |
-|---|---|
-| `POST /score` | chấm 1 giao dịch, cập nhật velocity state, trả `decision` và reason codes nếu bị gắn cờ |
-| `POST /score/batch` | tối đa 1.000 giao dịch, tự sắp theo thời gian |
-| `GET /monitoring/drift` | PSI của 5.000 giao dịch gần nhất so với tháng valid, cộng tỉ lệ gắn cờ so với ngân sách |
-| `GET /model` | version, ngưỡng, kỳ train/valid/test, metric trên test |
-| `GET /health` | health check |
+| Endpoint | Quyền | Việc |
+|---|---|---|
+| `POST /score` | scorer, analyst | chấm 1 giao dịch và ghi vào velocity state |
+| `POST /score/batch` | scorer, analyst | tối đa 1.000 giao dịch, tự sắp theo thời gian |
+| `GET /monitoring/drift` | analyst | PSI của 5.000 giao dịch gần nhất so với tháng valid, tỉ lệ gắn cờ so với ngân sách |
+| `GET /model` | analyst | version, ngưỡng, metric, số sự kiện bị từ chối ghi, số entity bị dọn |
+| `GET /health` | mở | health check |
 
-Tham số `update_state=false` để chấm thử mà không tính vào lịch sử; `explain=all|review|none`
-chọn giao dịch nào có SHAP reason codes (mặc định chỉ giao dịch bị đưa vào hàng đợi review,
-vì TreeSHAP tốn vài ms mỗi dòng còn chấm điểm chưa tới 1 ms).
+Chỉ analyst được dùng `update_state=false` (chấm thử, không ghi vào lịch sử) và
+`explain=all|review|none` (chọn giao dịch nào có SHAP reason codes; mặc định chỉ giao dịch bị
+đưa vào hàng đợi review, vì TreeSHAP tốn vài ms mỗi dòng còn chấm điểm chưa tới 1 ms).
+
+Cấu hình bằng biến môi trường:
+
+| Biến | Mặc định | Ý nghĩa |
+|---|---|---|
+| `FRAUD_ARTIFACTS` | `artifacts/synthetic` | thư mục bundle đã train |
+| `FRAUD_API_KEYS` | (bắt buộc*) | key cho hệ thống thanh toán, phân cách bằng dấu phẩy, mỗi key >= 16 ký tự |
+| `FRAUD_ANALYST_API_KEYS` | (bắt buộc*) | key cho analyst |
+| `FRAUD_AUTH_DISABLED` | - | `1` để tắt xác thực, chỉ dùng khi phát triển |
+| `FRAUD_MAX_FUTURE_SKEW_S` | `300` | giao dịch được ghi vào state chỉ khi không vượt đồng hồ của service quá ngần này giây; `off` khi replay nhanh hơn thời gian thực |
+| `FRAUD_MAX_ENTITIES` | `1000000` | số thẻ/khách tối đa giữ trong state cho mỗi loại entity |
+| `FRAUD_ENTITY_TTL_DAYS` | `400` | quên thẻ/khách không giao dịch lâu hơn ngần này ngày |
+
+\* Service không khởi động nếu không có key nào (trừ khi `FRAUD_AUTH_DISABLED=1`).
 
 ## Các quyết định thiết kế
 
@@ -204,6 +228,27 @@ Drift check đã bắt được lỗi của chính project: phiên bản đầu 
 feature đó thực chất là đồng hồ thời gian, PSI giữa valid và test lên tới 5,2. Feature này
 đã bị bỏ; số giao dịch trước đó và D1 mang thông tin hữu ích mà không trôi theo lịch.
 
+### 7. Bảo mật API
+
+Một lần security review đã tìm ra 4 vấn đề trong bản đầu; cả 4 đã được sửa và có test hồi quy
+(`tests/test_pipeline_api.py`, `tests/test_velocity.py`):
+
+1. **Timestamp giả mạo xoá được lịch sử velocity.** `TransactionDT` do người gọi gửi, và việc
+   dọn sự kiện cũ dựa vào chính giá trị đó: một giao dịch đề ngày sau 30 ngày đã xoá sạch cửa
+   sổ 1h/24h của thẻ và cả nhóm BIN (`uid_cnt_1h` từ 6 về 1). Giờ giao dịch luôn được chấm điểm
+   nhưng chỉ được **ghi** vào state khi (a) không vượt đồng hồ của service quá 300 giây (đồng hồ
+   chạy theo thời gian thực, không theo timestamp của giao dịch, nên không thể bị đẩy dần lên)
+   và (b) không cũ hơn sự kiện cuối của thẻ/khách đó. Lần ghi bị từ chối được đếm trong `/model`.
+2. **API không có xác thực.** Giờ bắt buộc API key (so sánh constant-time), service không khởi
+   động nếu thiếu key.
+3. **API là máy dò cho kẻ gian lận.** Key scorer chỉ nhận `decision`; điểm, ngưỡng, reason
+   codes, chấm thử (`update_state=false`), `/model` và `/monitoring/drift` chỉ dành cho analyst.
+4. **State tăng không giới hạn.** Mỗi loại entity giữ tối đa 1 triệu thẻ/khách (bỏ cái lâu
+   không dùng nhất trước) và quên entity không hoạt động quá 400 ngày, cả hai đều không chạm tới
+   dữ liệu IEEE-CIS nên không làm lệch feature so với lúc train.
+
+Rate limit và giới hạn kích thước request thuộc về API gateway đứng trước service.
+
 ## Câu hỏi phỏng vấn hay gặp
 
 <details>
@@ -227,7 +272,17 @@ thật, lịch sử giao dịch luôn có sẵn ngay lập tức; chỉ có nhã
 
 Hai đường tính feature (batch và online) có test so khớp, và `replay.py` bắn toàn bộ tháng
 test qua API rồi so điểm với điểm offline: chênh lệch lớn nhất là 0,0 trên 48.040 giao dịch
-(độ trễ mỗi request p50 2,7 ms, p95 3,9 ms với client HTTP trong cùng process).
+(độ trễ mỗi request p50 2,3 ms, p95 3,2 ms với client HTTP trong cùng process).
+</details>
+
+<details>
+<summary><b>API chấm điểm gian lận có thể bị lợi dụng thế nào?</b></summary>
+
+Kẻ gian không cần phá model, chỉ cần tác động vào dữ liệu đầu vào của nó. Nếu gọi được API,
+họ có thể (1) gửi giao dịch giả để làm sạch lịch sử velocity của thẻ trước khi quẹt thật,
+(2) dò xem giao dịch nào lọt dưới ngưỡng nhờ điểm số và SHAP, (3) bơm thẻ giả cho tới khi
+service hết RAM. Project chặn cả ba: ghi state có điều kiện về thời gian, phân quyền theo key
+(kênh thanh toán chỉ thấy quyết định), giới hạn kích thước state. Xem mục "Bảo mật API".
 </details>
 
 <details>
@@ -272,7 +327,7 @@ src/fraud_detection/
   drift.py          PSI cho feature và điểm số
   train.py          pipeline end-to-end, xuất report + bundle
   replay.py         phát lại tháng test qua API
-  api/              FastAPI app, schema, service
+  api/              FastAPI app, schema, service, xác thực API key
 tests/              velocity, feature, metric, split, drift, pipeline + API
 reports/synthetic/  báo cáo mẫu sinh ra từ `make train`
 ```
@@ -282,8 +337,13 @@ reports/synthetic/  báo cáo mẫu sinh ra từ `make train`
 - Số liệu trong README là synthetic; cần chạy lại trên IEEE-CIS để có kết quả thật.
 - `uid` chỉ là ước lượng danh tính khách; ngân hàng thật có customer ID.
 - Velocity state nằm trong bộ nhớ của một process: chạy nhiều worker uvicorn thì mỗi worker
-  có state riêng. Bản production đưa state ra Redis hoặc feature store, có TTL.
-- Giả định giao dịch đến đúng thứ tự thời gian; sự kiện đến trễ cần xử lý riêng.
+  có state riêng. Bản production đưa state ra Redis hoặc feature store.
+- Giao dịch đến trễ (cũ hơn sự kiện cuối của thẻ) vẫn được chấm nhưng không được ghi vào
+  state; hệ thống thật cần một hàng đợi sắp xếp lại sự kiện trước khi chấm.
+- Đồng hồ của service bắt đầu từ thời điểm cuối của dữ liệu lịch sử; khi triển khai thật,
+  `TransactionDT` nên là epoch giây và đồng hồ neo theo giờ hệ thống.
+- API key là cơ chế xác thực tối thiểu; production nên dùng mTLS hoặc OAuth2 giữa các
+  service, kèm rate limit ở gateway.
 - Chưa có calibration, chưa train theo trọng số số tiền, chưa có quy trình champion/challenger
   và retrain định kỳ.
 - Dockerfile chưa được build thử trong môi trường phát triển (không có Docker daemon).

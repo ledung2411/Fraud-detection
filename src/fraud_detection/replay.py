@@ -1,12 +1,16 @@
 """Replay the test month through the API as if it were live traffic.
 
     python -m fraud_detection.replay --config configs/synthetic.yaml --limit 5000
-    python -m fraud_detection.replay --config configs/ieee.yaml --url http://localhost:8000
+    FRAUD_API_KEY=<analyst key> python -m fraud_detection.replay --url http://localhost:8000
 
 The API starts from the velocity state at the beginning of the test month and
 builds every feature itself, one transaction at a time. Comparing its scores with
 the offline (batch) scores of the same rows proves there is no training/serving
 skew; the run also reports latency, the live alert rate and the drift check.
+
+A month is replayed in minutes, far faster than real time, so a server used with
+``--url`` must run with ``FRAUD_MAX_FUTURE_SKEW_S=off``; otherwise it rightly refuses
+to record events dated ahead of its clock. Scores need an analyst key.
 """
 
 from __future__ import annotations
@@ -15,6 +19,8 @@ import argparse
 import json
 import logging
 import math
+import os
+import secrets
 import time
 from typing import Any
 
@@ -76,13 +82,19 @@ def replay(cfg: Config, url: str | None = None, limit: int = 5000, batch_size: i
     if url:
         import httpx
 
-        client = httpx.Client(base_url=url, timeout=30)
+        headers = {"X-API-Key": os.environ.get("FRAUD_API_KEY", "")}
+        client = httpx.Client(base_url=url, timeout=30, headers=headers)
     else:
         from fastapi.testclient import TestClient
 
         from .api.app import create_app
+        from .api.auth import ApiKeyAuth
 
-        client = TestClient(create_app(cfg.output.artifact_dir)).__enter__()
+        key = secrets.token_urlsafe(24)  # throwaway analyst key for the in-process app
+        app = create_app(
+            cfg.output.artifact_dir, ApiKeyAuth(analyst_keys=[key]), max_future_skew_s=None
+        )
+        client = TestClient(app, headers={"X-API-Key": key}).__enter__()
 
     online, latency = [], []
     for i in range(0, len(payload), batch_size):

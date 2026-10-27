@@ -6,7 +6,7 @@ import pytest
 
 from fraud_detection.data import add_time_columns, sort_chronologically
 from fraud_detection.synthetic import generate
-from fraud_detection.velocity import OnlineVelocityStore, compute_velocity
+from fraud_detection.velocity import OnlineVelocityStore, OutOfOrderEventError, compute_velocity
 
 ENT = {"card1": ["card1"], "uid": ["card1", "addr1", "D1n"]}
 WIN = {"1h": 3600, "24h": 86400, "7d": 7 * 86400}
@@ -110,3 +110,58 @@ def test_compute_does_not_mutate(stream):
     store = OnlineVelocityStore.from_frame(stream, ENT, WIN)
     rec = stream.iloc[-1].to_dict()
     assert store.compute(rec) == store.compute(rec)
+
+
+def _txn(i, t, card, amt=10.0):
+    return {
+        "TransactionID": i,
+        "TransactionDT": t,
+        "TransactionAmt": amt,
+        "card1": card,
+        "addr1": 1.0,
+        "D1n": 5.0,
+    }
+
+
+def test_update_refuses_out_of_order_events_without_partial_writes():
+    store = OnlineVelocityStore(ENT, WIN)
+    store.update(_txn(1, 1000, card=7))
+    with pytest.raises(OutOfOrderEventError):
+        store.update(_txn(2, 500, card=7))
+    assert all(st.n == 1 for states in store.state.values() for st in states.values())
+
+
+def test_late_event_sees_only_its_own_past():
+    store = OnlineVelocityStore(ENT, WIN)
+    for i, t in enumerate((1000, 1100, 5000)):
+        store.update(_txn(i, t, card=7))
+    f = store.compute(_txn(9, 1200, card=7))  # arrives after the t=5000 event
+    assert f["card1_cnt_1h"] == 2  # t=1000 and t=1100, not the later t=5000
+    assert f["card1_secs_since_prev"] >= 0
+
+
+def test_state_is_capped_and_idle_entities_expire():
+    store = OnlineVelocityStore({"card1": ["card1"]}, {"1h": 3600}, max_entities=3, ttl_s=None)
+    for i in range(5):
+        store.update(_txn(i, 100 + i, card=i))
+    assert list(k[0] for k in store.state["card1"]) == [2.0, 3.0, 4.0]
+    assert store.evicted["card1"] == 2
+    store.update(_txn(10, 200, card=2))  # touching an entity makes it most recent
+    store.update(_txn(11, 201, card=99))
+    assert list(k[0] for k in store.state["card1"]) == [4.0, 2.0, 99.0]
+
+    ttl = OnlineVelocityStore({"card1": ["card1"]}, {"1h": 3600}, max_entities=None, ttl_s=100)
+    ttl.update(_txn(1, 0, card=1))
+    ttl.update(_txn(2, 60, card=2))
+    ttl.update(_txn(3, 150, card=3))  # card 1 idle for 150s > TTL
+    assert sorted(k[0] for k in ttl.state["card1"]) == [2.0, 3.0]
+
+
+def test_store_from_history_respects_the_cap(stream):
+    store = OnlineVelocityStore.from_frame(stream, ENT, WIN, max_entities=50)
+    assert len(store.state["uid"]) == 50
+    last = stream.dropna(subset=["addr1", "D1n"]).drop_duplicates(
+        ["card1", "addr1", "D1n"], keep="last"
+    )
+    newest = {(float(r.card1), float(r.addr1), float(r.D1n)) for r in last.tail(50).itertuples()}
+    assert set(store.state["uid"]) == newest
